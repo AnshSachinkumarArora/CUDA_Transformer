@@ -1,4 +1,3 @@
-from CUDA_Transformer.cuda_autograd_fns import cuda_causal_self_attention, cuda_flash_attention, cuda_gelu_layer, cuda_linear_layer
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -6,8 +5,8 @@ from torch.optim.adamw import AdamW
 torch.manual_seed(117)
 import numpy as np
 import tiktoken
-from CUDA_Transformer.cuda_autograd_fns import cuda_softmax_layer
 import time
+from cuda_autograd_fns import cuda_causal_self_attention, cuda_flash_attention, cuda_gelu_layer, cuda_linear_layer, cuda_softmax_layer
 
 if not torch.cuda.is_available():
     raise RuntimeError("Aborting run: CUDA is required")
