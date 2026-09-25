@@ -23,8 +23,24 @@ for _ in range(5):
     out.backward(dO)
 torch.cuda.synchronize()
 
-# Forward pass
+# Setup random output grads
+dO = torch.rand_like(out) 
+torch.cuda.synchronize()
+
+# Start profiler
 torch.cuda.profiler.start()
+
+# Forward pass
+torch.cuda.nvtx.range_push('cuda_fa2_forward')
 out, L = run_kernel()
 torch.cuda.synchronize()
+torch.cuda.nvtx.range_pop
+
+# Backward pass
+torch.cuda.nvtx.range_push('cuda_fa2_backward')
+out.backward(dO)
+torch.cuda.synchronize()
+torch.cuda.nvtx.range_pop
+
+# Stop profiler
 torch.cuda.profiler.stop()
