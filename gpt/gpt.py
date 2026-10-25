@@ -6,7 +6,7 @@ torch.manual_seed(117)
 import numpy as np
 import tiktoken
 import time
-from cuda_autograd_fns import cuda_causal_self_attention, cuda_flash_attention, cuda_gelu_layer, cuda_linear_layer, cuda_softmax_layer
+from cuda_autograd_fns import CudaSoftmaxLayer, CudaLinearLayer, CudaGeluLayer, CudaFlashAttention, CudaCausalSelfAttention
 
 if not torch.cuda.is_available():
     raise RuntimeError("Aborting run: CUDA is required")
@@ -95,21 +95,21 @@ class CausalSelfAttention(nn.Module):
         B, T, C = tokens.shape
         
         #get QKV
-        qkv = cuda_linear_layer.CudaLinearLayer.apply(tokens, self.qkv_weight, self.qkv_bias) #(B, T, 3C)
+        qkv = CudaLinearLayer.apply(tokens, self.qkv_weight, self.qkv_bias) #(B, T, 3C)
 
         #calculate attention
         if not use_flash_attention:
-            attention_out = cuda_causal_self_attention.CudaCausalSelfAttention.apply(qkv, self.num_heads, True) #(B, T, C)
+            attention_out = CudaCausalSelfAttention.apply(qkv, self.num_heads, True) #(B, T, C)
         else:
             q, k, v = qkv.chunk(3, dim=-1) #(B, T, C) each
             q = q.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
             k = k.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
             v = v.reshape(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-            attention_out, _ = cuda_flash_attention.CudaFlashAttention.apply(q, k, v, True) #(B, nh, T, hs)
+            attention_out, _ = CudaFlashAttention.apply(q, k, v, True) #(B, nh, T, hs)
             attention_out = attention_out.transpose(1, 2).reshape(B, T, C)
 
         #calculate output
-        output = cuda_linear_layer.CudaLinearLayer.apply(attention_out, self.out_weight, self.out_bias) #(B, T, C)
+        output = CudaLinearLayer.apply(attention_out, self.out_weight, self.out_bias) #(B, T, C)
 
         return output
 
@@ -131,9 +131,9 @@ class MLP(nn.Module):
         
 
     def forward(self, tokens):
-        tokens = cuda_linear_layer.CudaLinearLayer.apply(tokens, self.fc1_weights, self.fc1_bias)
-        tokens = cuda_gelu_layer.CudaGeluLayer.apply(tokens)
-        tokens = cuda_linear_layer.CudaLinearLayer.apply(tokens, self.fc2_weights, self.fc2_bias)
+        tokens = CudaLinearLayer.apply(tokens, self.fc1_weights, self.fc1_bias)
+        tokens = CudaGeluLayer.apply(tokens)
+        tokens = CudaLinearLayer.apply(tokens, self.fc2_weights, self.fc2_bias)
         return tokens
     
 class DecoderBlock(nn.Module):
@@ -164,7 +164,7 @@ class GPT(nn.Module):
         for layer in self.mha:
             x = layer(x, use_flash_attention)
         x = self.ln(x)
-        logits = cuda_linear_layer.CudaLinearLayer.apply(x, self.lm_head_weights, self.lm_head_bias)
+        logits = CudaLinearLayer.apply(x, self.lm_head_weights, self.lm_head_bias)
 
         if y is None:
             loss = None
@@ -181,7 +181,7 @@ class GPT(nn.Module):
             idx = idx if idx.shape[-1] <= block_size else idx[:, -block_size:]
             logits, loss = self(idx)
             logits = logits[:, -1, :]
-            probs = cuda_softmax_layer.CudaSoftmaxLayer.apply(logits.unsqueeze(1)).squeeze(1)
+            probs = CudaSoftmaxLayer.apply(logits.unsqueeze(1)).squeeze(1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
         return idx

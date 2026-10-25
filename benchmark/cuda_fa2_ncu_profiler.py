@@ -1,6 +1,6 @@
 import torch
 import math
-from cuda_autograd_fns import cuda_flash_attention
+from cuda_autograd_fns import CudaFlashAttention
 
 # Setup hyperparams and tensors
 B, H, N, D = 4, 32, 4096, 64
@@ -14,7 +14,7 @@ k = torch.randn(B, H, N, D, device=device, dtype=dtype, requires_grad=True)
 v = torch.randn(B, H, N, D, device=device, dtype=dtype, requires_grad=True)
 
 def run_kernel():
-    return cuda_flash_attention.CudaFlashAttention.apply(q, k, v, causal)
+    return CudaFlashAttention.apply(q, k, v, causal)
 
 # Kernel warmup
 for _ in range(5):
