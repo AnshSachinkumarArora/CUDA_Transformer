@@ -3,7 +3,7 @@
 A from-scratch Transformer implementation where every core operation **including Flash-Attention 2 (forward and backward), GEMM, LayerNorm, GELU, and Softmax** is written directly in C++/CUDA (FP32) without relying on cuBLAS, cuDNN, or PyTorch's native C++ attention kernels.  
 Built as a ground-up systems baseline to study GPU memory hierarchies, warp scheduling, shared-memory bank conflicts, and register tiling on NVIDIA's Blackwell architecture (sm_120).
 
-<!-- > **Companion project:** the same architecture with every kernel (GEMM, GELU, softmax, attention) hand-written in CUDA: **[TODO: link to cuda-transformer repo]** -->
+> **Companion project:** The same GPT architecture accelerated with a register-tiled **Triton Flash-Attention 2** implementation (achieving 3.69×–6.07× speedups over this naive CUDA baseline and matching PyTorch SDPA at long sequence lengths): **<a href="https://github.com/AnshSachinkumarArora/FusedLM">FusedLM</a>**
 
 ## Highlights
 
@@ -66,8 +66,9 @@ Collected with `ncu --set full`. Run config: **`dtype, B, H, N, D, causal = FP32
 | `flash_attention_bwd_dq`     | 348.42 ms | 37.08%        | 95.01%            | 95.36%            | 66.46%             | 40            | 23,680 B (23.1 KB)| 65.03 FLOPs/Byte     |
 | `flash_attention_bwd_dk_dv`  | 901.43 ms | 47.01%        | 89.65%            | 89.70%            | 49.93%             | 56            | 27,776 B (27.1 KB)| 73.98 FLOPs/Byte     |
 
-*"Memory throughput" is Nsight Compute's speed-of-light metric (the highest utilization across L1, L2, and DRAM). Arithmetic intensity is calculated directly from hardware `FFMA` instruction counters (`smsp__sass_thread_inst_executed_op_ffma_pred_on.sum.per_cycle_elapsed` $\times$ elapsed cycles $\times 2$) divided by physical DRAM bytes transferred (`dram__sectors_op_read/write.sum` $\times 32$).*
+*"Memory throughput" is Nsight Compute's speed-of-light metric (the highest utilization across L1, L2, and DRAM). Arithmetic intensity is calculated directly from hardware `FFMA` instruction counters (`smsp__sass_thread_inst_executed_op_ffma_pred_on.sum.per_cycle_elapsed` x elapsed cycles x 2) divided by physical DRAM bytes transferred (`dram__sectors_op_read/write.sum` x 32).*
 
+<details>
 <summary><b>View raw output from <code>parse_ncu_report.py</code></b></summary>
 
 ```text
@@ -198,13 +199,13 @@ Arithmetic Intensity    : 73.98 FLOPs/Byte
 ### Observations
 
 - **The Occupancy Illusion (83.0% Occupancy vs. 92.0% L1 Thrashing):** The forward kernel achieves **83.04% occupancy** by keeping register pressure low (40 registers/thread) and static shared memory modest (17.5 KB/block). However, because each thread computes scalar 1D dot products directly out of shared memory rather than holding 2D sub-tiles in local registers, the kernel hammers the shared memory / L1 pipeline (**91.99% L1/TEX throughput** in `fwd`, **95.36%** in `bwd_dq`, and **89.70%** in `bwd_dk_dv`) while DRAM bandwidth sits idle (~3%).
-- **Shared-Memory Bank Conflicts & MIO Queue Stalls:** Strided shared-memory loads across the $16 \times 16$ thread block trigger **4.3-way (`fwd`), 5.7-way (`bwd_dq`), and 3.9-way (`bwd_dk_dv`) shared-memory bank conflicts**, generating 68%–75% excessive shared wavefronts and stalling warps for 18.7–32.6 cycles per instruction waiting on the Memory Input/Output (MIO) queue.
-- **Barrier Synchronization (`__syncthreads()`) Dominates Warp Stalls:** Across all four kernels, `Barrier Sync Stall` accounts for **78.9% to 85.3%** of the sampled stall events (`1,935,450` samples in `fwd` and `3,029,581` samples in `bwd_dk_dv`, compared to `257,357` and `539,819` memory dependency samples). Small $16 \times 16$ tiles force threads to hit `__syncthreads()` barriers every 16 elements along the sequence dimension, amplified by warp branch divergence (79.0%–84.7% branch efficiency) on causal boundary masks.
+- **Shared-Memory Bank Conflicts & MIO Queue Stalls:** Strided shared-memory loads across the 16 x 16 thread block trigger **4.3-way (`fwd`), 5.7-way (`bwd_dq`), and 3.9-way (`bwd_dk_dv`) shared-memory bank conflicts**, generating 68%–75% excessive shared wavefronts and stalling warps for 18.7–32.6 cycles per instruction waiting on the Memory Input/Output (MIO) queue.
+- **Barrier Synchronization (`__syncthreads()`) Dominates Warp Stalls:** Across all four kernels, `Barrier Sync Stall` accounts for **78.9% to 85.3%** of the sampled stall events (`1,935,450` samples in `fwd` and `3,029,581` samples in `bwd_dk_dv`, compared to `257,357` and `539,819` memory dependency samples). Small 16 x 16 tiles force threads to hit `__syncthreads()` barriers every 16 elements along the sequence dimension, amplified by warp branch divergence (79.0%–84.7% branch efficiency) on causal boundary masks.
 - **High Arithmetic Intensity is Necessary but Not Sufficient:** The attention kernels achieve high DRAM arithmetic intensities (**76.94 FLOPs/Byte** in `fwd`, **65.03 FLOPs/Byte** in `bwd_dq`, and **73.98 FLOPs/Byte** in `bwd_dk_dv`), proving that the FlashAttention tiling successfully keeps traffic off HBM. However, shifting the bottleneck from HBM to Shared Memory without register-level tiling simply trades a DRAM bottleneck for an L1/MIO ceiling at **1.44 TFLOPS** (fwd) and **0.99 TFLOPS** (bwd).
 
 ## Development notes
 
-- **Uncoalesced Causal Loop in `bwd_dk_dv` Doubles Executed FLOPs:** Comparing hardware `FFMA` counters between this repository and the companion Triton implementation reveals that `flash_attention_bwd_dq` executes nearly identical math (**431.2 GFLOPs** in CUDA vs. **423.1 GFLOPs** in Triton, a `1.02×` ratio), whereas `flash_attention_bwd_dk_dv` executes **1,133.9 GFLOPs** in CUDA vs. **562.7 GFLOPs** in Triton (**2.02×** the FLOPs). While `bwd_dq` skips upper-triangular masked blocks, `bwd_dk_dv` iterates across all $Q$ tiles before applying the causal mask inside the inner loop, computing the full $N^2$ attention matrix instead of starting the $Q$-tile loop at the causal diagonal.
+- **Uncoalesced Causal Loop in `bwd_dk_dv` Doubles Executed FLOPs:** Comparing hardware `FFMA` counters between this repository and the companion Triton implementation reveals that `flash_attention_bwd_dq` executes nearly identical math (**431.2 GFLOPs** in CUDA vs. **423.1 GFLOPs** in Triton, a `1.02×` ratio), whereas `flash_attention_bwd_dk_dv` executes **1,133.9 GFLOPs** in CUDA vs. **562.7 GFLOPs** in Triton (**2.02×** the FLOPs). While `bwd_dq` skips upper-triangular masked blocks, `bwd_dk_dv` iterates across all Q tiles before applying the causal mask inside the inner loop, computing the full N^2 attention matrix instead of starting the Q-tile loop at the causal diagonal.
 - **Blackwell (`sm_120`) Hardware Counter Changes in `ncu_report`:** On Blackwell's Performance Monitoring Units (PMUs), Nsight Compute records instruction rates (`smsp__sass_thread_inst_executed_op_ffma_pred_on.sum.per_cycle_elapsed`) rather than cumulative `.sum` instruction counters to prevent counter overflow on long kernels, and renames physical DRAM sector counters to `dram__sectors_op_read.sum` and `dram__sectors_op_write.sum`. `parse_ncu_report.py` handles both naming conventions automatically.
 
 ## Repository layout
@@ -270,7 +271,7 @@ python parse_ncu_report.py --report_path cuda_fa2_profile.ncu-repz
 
 ## Roadmap
 
-- [ ] Advance the starting $Q$-tile index to the causal diagonal in `flash_attention_bwd_dk_dv` to eliminate the $2\times$ redundant upper-triangle FLOPs
+- [ ] Advance the starting Q-tile index to the causal diagonal in `flash_attention_bwd_dk_dv` to eliminate the 2x redundant upper-triangle FLOPs
 - [ ] Implement 2D register tiling (increasing per-thread register blocking) to shift operand reuse from Shared Memory into the register file and relieve the 92%–95% L1/TEX bottleneck
 - [ ] Pad or swizzle shared-memory tiles to eliminate the 3.9–5.7-way bank conflicts
 - [ ] Add `FP16` / `BF16` WMMA / MMA Tensor Core kernels to compare against Triton's `tl.dot` pipeline
